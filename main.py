@@ -41,6 +41,9 @@ from forecasting_tools import (
     structure_output,
 )
 
+from news_research import google_news_research
+from throttled_llm import ThrottledLlm
+
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -156,6 +159,12 @@ class FallTemplateBot2026(ForecastBot):
                     use_advanced_filters=False,
                 )
                 research = await searcher.invoke(prompt)
+            elif researcher == "google-news":
+                research = await google_news_research(
+                    question,
+                    query_llm=self.get_llm("summarizer", "llm"),
+                    writer_llm=self.get_llm("default", "llm"),
+                )
             elif not researcher or researcher == "None" or researcher == "no_research":
                 research = ""
             else:
@@ -697,11 +706,16 @@ if __name__ == "__main__":
         default="tournament",
         help="What to forecast on (default: tournament)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Forecast but don't publish anything to Metaculus",
+    )
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     check_environment(strict=True)
-    publish_to_metaculus = True
+    publish_to_metaculus = not args.dry_run
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
     # Configure the bot. The `llms=` block below is commented out to use
@@ -715,17 +729,25 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        # Google AI Studio free tier: Gemini Flash allows only 20 requests/day
+        # and Pro/search grounding are unavailable, so everything runs on the
+        # open Gemma 4 model and research comes from Google News RSS
+        # (news_research.py).
+        llms={
+            "default": ThrottledLlm(
+                model="gemini/gemma-4-26b-a4b-it",
+                temperature=0.3,
+                timeout=180,
+                allowed_tries=3,
+            ),
+            "summarizer": ThrottledLlm(
+                model="gemini/gemma-4-26b-a4b-it", timeout=120, allowed_tries=3
+            ),
+            "researcher": "google-news",
+            "parser": ThrottledLlm(
+                model="gemini/gemma-4-26b-a4b-it", timeout=120, allowed_tries=3
+            ),
+        },
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These

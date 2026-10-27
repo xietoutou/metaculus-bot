@@ -174,3 +174,7 @@ cython_debug/
 
 # Local scratch/temp scripts
 temp/
+
+# local dry runs
+dry_gemma.log
+dry_reports/
