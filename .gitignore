@@ -178,3 +178,8 @@ temp/
 # local dry runs
 dry_gemma.log
 dry_reports/
+
+# Claude Code CLI scratch dir and usage log (local runs only)
+.claude_work/
+claude_usage.log
+local_runs/

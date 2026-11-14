@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -42,6 +43,8 @@ from forecasting_tools import (
 )
 
 from news_research import google_news_research
+import claude_cli
+from claude_cli import ClaudeUnavailable, claude_ask
 from throttled_llm import ThrottledLlm
 
 dotenv.load_dotenv()
@@ -128,10 +131,31 @@ class FallTemplateBot2026(ForecastBot):
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+    # Set by --claude-numeric (local runs only): numeric and discrete questions
+    # get web research and forecasts from Claude via the Claude Code CLI, with
+    # Gemma as the fallback when Claude is unavailable.
+    claude_numeric = False
+
+    def _use_claude(self, question: MetaculusQuestion) -> bool:
+        return (
+            self.claude_numeric
+            and isinstance(question, NumericQuestion)
+            and claude_cli.available()
+        )
 
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
+        if self._use_claude(question):
+            try:
+                research = await claude_ask(
+                    self._claude_research_prompt(question), web=True, timeout=900
+                )
+                research = "(Research by Claude with web search.)\n" + research
+                logger.info(f"Found Claude research for URL {question.page_url}:\n{research}")
+                return research
+            except ClaudeUnavailable as e:
+                logger.warning(f"Claude research failed for {question.page_url}, falling back: {e}")
         async with self._concurrency_limiter:
             research = ""
             researcher = self.get_llm("researcher")
@@ -171,6 +195,64 @@ class FallTemplateBot2026(ForecastBot):
                 research = await self.get_llm("researcher", "llm").invoke(prompt)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    @staticmethod
+    def _read_percentiles(text: str) -> list[Percentile] | None:
+        """Read the final "Percentile N: X" block; None if any of the six is missing."""
+        found: dict[int, float] = {}
+        for m in re.finditer(
+            r"Percentile\s*(10|20|40|60|80|90)\s*:\s*\**\s*([-−]?[\d,]*\.?\d+)", text
+        ):
+            found[int(m.group(1))] = float(m.group(2).replace(",", "").replace("−", "-"))
+        keys = [10, 20, 40, 60, 80, 90]
+        if any(k not in found for k in keys):
+            return None
+        values = [found[k] for k in keys]
+        spread = max(values) - min(values)
+        eps = spread * 1e-4 if spread > 0 else max(abs(values[0]), 1.0) * 1e-6
+        for i in range(1, len(values)):  # break ties so values strictly increase
+            if values[i] <= values[i - 1]:
+                values[i] = values[i - 1] + eps
+        return [Percentile(percentile=k / 100, value=v) for k, v in zip(keys, values)]
+
+    @staticmethod
+    def _claude_research_prompt(question: MetaculusQuestion) -> str:
+        return clean_indents(
+            f"""
+            You are the research assistant to a professional forecaster. Use web search and
+            web fetch to gather the facts needed to forecast the numeric question below.
+            Do not forecast yourself; report facts.
+
+            Prioritise primary sources: the official agency, statistics office, company
+            filing or dataset named in the resolution criteria. Open the actual release or
+            data page when you can, not only news coverage.
+
+            Report, with dates and source URLs:
+            1. Whether the resolving value has already been published. If it has, state it
+               exactly and quote the source.
+            2. The most recent values of the same series (at least the last 6 releases or
+               observations when they exist), so the forecaster can judge typical changes.
+            3. When the next relevant release is scheduled.
+            4. Consensus forecasts, guidance, nowcasts or market prices for this value.
+            5. Anything unusual that could move the value outside its normal range.
+
+            Keep it under 600 words.
+
+            Today is {datetime.now().strftime("%Y-%m-%d")}.
+
+            Question:
+            {question.question_text}
+
+            Resolution criteria:
+            {question.resolution_criteria}
+
+            Fine print:
+            {question.fine_print}
+
+            Background:
+            {question.background_info}
+            """
+        )
 
     @staticmethod
     def _get_research_prompt(
@@ -409,7 +491,31 @@ class FallTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = None
+        if self._use_claude(question):
+            claude_prompt = prompt.replace(
+                "You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.",
+                "Calibrate your interval: the true value should fall below your 10th percentile about 10% of the time and above your 90th percentile about 10% of the time. If official data already pins the value down, a narrow distribution is correct.",
+            )
+            try:
+                reasoning = await claude_ask(claude_prompt, web=False, timeout=600)
+                reasoning = "(Forecast reasoning by Claude.)\n" + reasoning
+            except ClaudeUnavailable as e:
+                logger.warning(f"Claude forecast failed for {question.page_url}, falling back: {e}")
+        if reasoning is not None:
+            # Claude follows the "Percentile N: X" format reliably; reading it
+            # directly avoids the Gemma parser, which rejects ties such as
+            # P40 = P60.
+            percentile_list = self._read_percentiles(reasoning)
+            if percentile_list is not None:
+                logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+                prediction = NumericDistribution.from_question(percentile_list, question)
+                logger.info(
+                    f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
+                )
+                return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+        if reasoning is None:
+            reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -707,6 +813,17 @@ if __name__ == "__main__":
         help="What to forecast on (default: tournament)",
     )
     parser.add_argument(
+        "--minibench",
+        choices=["include", "skip", "only"],
+        default="include",
+        help="Tournament mode: whether to forecast MiniBench too (default: include)",
+    )
+    parser.add_argument(
+        "--claude-numeric",
+        action="store_true",
+        help="Use Claude (local Claude Code CLI) for numeric/discrete research and forecasts",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Forecast but don't publish anything to Metaculus",
@@ -750,6 +867,8 @@ if __name__ == "__main__":
         },
     )
 
+    template_bot.claude_numeric = args.claude_numeric
+
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
     # whenever those rotate seasons.
@@ -764,16 +883,22 @@ if __name__ == "__main__":
     # summary printers below.
     client = MetaculusClient()
     if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+        # MiniBench runs locally (with Claude for numeric questions), so the
+        # GitHub workflow passes --minibench skip and the local runner --minibench only.
+        seasonal_tournament_reports = []
+        minibench_reports = []
+        if args.minibench != "only":
+            seasonal_tournament_reports = asyncio.run(
+                template_bot.forecast_on_tournament(
+                    client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+                )
             )
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
+        if args.minibench != "skip":
+            minibench_reports = asyncio.run(
+                template_bot.forecast_on_tournament(
+                    client.CURRENT_MINIBENCH_ID, return_exceptions=True
+                )
             )
-        )
         forecast_reports = seasonal_tournament_reports + minibench_reports
     elif run_mode == "metaculus_cup":
         # The Metaculus Cup may be uninitialized near the start of a season

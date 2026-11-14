@@ -19,6 +19,8 @@ bot = m.FallTemplateBot2026(
         "parser": m.ThrottledLlm(model="gemini/gemma-4-26b-a4b-it", timeout=120, allowed_tries=3),
     },
 )
+import os
+bot.claude_numeric = os.environ.get("DRY_CLAUDE") == "1"
 t = time.time()
 reps = asyncio.run(bot.forecast_questions(qs, return_exceptions=True))
 for q, r in zip(qs, reps):
