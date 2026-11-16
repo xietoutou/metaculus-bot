@@ -70,7 +70,7 @@ def main() -> None:
                 rc = "timeout"
         text = log_path.read_text(encoding="utf-8", errors="replace")
         forecasted = text.count("Forecasted URL")
-        fallbacks = text.count("falling back")
+        fallbacks = text.count("Claude research failed") + text.count("Claude forecast failed")
         summary(
             f"rc={rc} {time.monotonic() - start:.0f}s predictions={forecasted} "
             f"claude_fallbacks={fallbacks} log={log_path.name}"
