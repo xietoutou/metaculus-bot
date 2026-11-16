@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -102,21 +103,30 @@ async def claude_ask(prompt: str, *, web: bool = False, timeout: float = 900) ->
         if not available():
             raise ClaudeUnavailable(_disabled_reason)
         start = time.monotonic()
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=WORK_DIR,
-            env=_child_env(),
-            creationflags=getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0),
-        )
+        # Feed the prompt from a file rather than a pipe: the CLI gives up on
+        # stdin after 3 s, and a busy event loop can miss that window.
+        fd, prompt_path = tempfile.mkstemp(suffix=".txt", dir=WORK_DIR)
         try:
-            out, err = await asyncio.wait_for(proc.communicate(prompt.encode("utf-8")), timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise ClaudeUnavailable(f"claude -p timed out after {timeout:.0f}s")
+            with os.fdopen(fd, "wb") as f:
+                f.write(prompt.encode("utf-8"))
+            with open(prompt_path, "rb") as stdin_file:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=stdin_file,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=WORK_DIR,
+                    env=_child_env(),
+                    creationflags=getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0),
+                )
+                try:
+                    out, err = await asyncio.wait_for(proc.communicate(), timeout)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    raise ClaudeUnavailable(f"claude -p timed out after {timeout:.0f}s")
+        finally:
+            Path(prompt_path).unlink(missing_ok=True)
         seconds = time.monotonic() - start
 
     text_out = out.decode("utf-8", errors="replace")
