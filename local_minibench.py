@@ -1,8 +1,8 @@
 """Local MiniBench runner, started every 20 minutes by a Windows scheduled task.
 
-MiniBench runs here instead of on GitHub Actions so numeric and discrete
-questions can use Claude through the logged-in Claude Code CLI
-(main.py --claude-numeric); other question types still use Gemma. The GitHub
+MiniBench runs here instead of on GitHub Actions so questions can use Claude
+through the logged-in Claude Code CLI (main.py --claude-all: every question
+type, Gemma only as the fallback). The GitHub
 workflow passes --minibench skip so the two never race for the same question.
 
 A lock file keeps runs from overlapping; each run's output goes to
@@ -62,7 +62,7 @@ def main() -> None:
             try:
                 rc = subprocess.run(
                     [str(PYTHON), "main.py", "--mode", "tournament",
-                     "--minibench", "only", "--claude-numeric", *sys.argv[1:]],
+                     "--minibench", "only", "--claude-all", *sys.argv[1:]],
                     cwd=HERE, stdout=log, stderr=subprocess.STDOUT, env=env,
                     timeout=TIMEOUT, creationflags=subprocess.CREATE_NO_WINDOW,
                 ).returncode

@@ -36,6 +36,7 @@ from forecasting_tools import (
     PredictionAffirmed,
     BinaryPrediction,
     PredictedOptionList,
+    PredictedOption,
     ReasonedPrediction,
     SmartSearcher,
     clean_indents,
@@ -135,13 +136,48 @@ class FallTemplateBot2026(ForecastBot):
     # get web research and forecasts from Claude via the Claude Code CLI, with
     # Gemma as the fallback when Claude is unavailable.
     claude_numeric = False
+    # Set by --claude-all (local runs only): binary, multiple-choice and numeric
+    # questions all get Claude research and forecasts (date questions get
+    # Claude research, Gemma forecasts).
+    claude_all = False
 
     def _use_claude(self, question: MetaculusQuestion) -> bool:
-        return (
-            self.claude_numeric
-            and isinstance(question, NumericQuestion)
-            and claude_cli.available()
-        )
+        if not claude_cli.available():
+            return False
+        if self.claude_all:
+            return isinstance(
+                question, (BinaryQuestion, MultipleChoiceQuestion, NumericQuestion, DateQuestion)
+            )
+        return self.claude_numeric and isinstance(question, NumericQuestion)
+
+    @staticmethod
+    def _read_binary_probability(text: str) -> float | None:
+        matches = re.findall(r"Probability\s*:\s*\**\s*(\d+(?:\.\d+)?)\s*%", text)
+        if not matches:
+            return None
+        return max(0.01, min(0.99, float(matches[-1]) / 100))
+
+    @staticmethod
+    def _read_option_probabilities(text: str, options: list[str]) -> list[float] | None:
+        """Read the final "<option>: NN%" lines; None unless every option is found."""
+        values = []
+        for option in options:
+            pattern = (
+                r"(?m)^[\s\-*•>]*(?:Option[_ ]?[A-Z0-9]*\s*[:.)-]?\s*)?[\"'“]?"
+                + re.escape(option.strip())
+                + r"[\"'”]?\**\s*[:：=]\s*\**\s*(\d+(?:\.\d+)?)\s*%?"
+            )
+            found = re.findall(pattern, text)
+            if not found:
+                return None
+            values.append(float(found[-1]))
+        total = sum(values)
+        if 90 <= total <= 110:
+            values = [v / 100 for v in values]
+        elif not 0.9 <= total <= 1.1:
+            return None
+        total = sum(values)
+        return [v / total for v in values]
 
     ##################################### RESEARCH #####################################
 
@@ -217,24 +253,54 @@ class FallTemplateBot2026(ForecastBot):
 
     @staticmethod
     def _claude_research_prompt(question: MetaculusQuestion) -> str:
+        if isinstance(question, NumericQuestion):
+            task = clean_indents(
+                """
+                Report, with dates and source URLs:
+                1. Whether the resolving value has already been published. If it has, state it
+                   exactly and quote the source.
+                2. The most recent values of the same series (at least the last 6 releases or
+                   observations when they exist), so the forecaster can judge typical changes.
+                3. When the next relevant release is scheduled.
+                4. Consensus forecasts, guidance, nowcasts or market prices for this value.
+                5. Anything unusual that could move the value outside its normal range.
+                """
+            )
+            kind = "numeric"
+        else:
+            task = clean_indents(
+                """
+                Report, with dates and source URLs:
+                1. Whether the outcome is already known or the resolution criteria are already
+                   met (or clearly cannot be met). If so, quote the source.
+                2. The latest concrete developments, and any scheduled events, deadlines,
+                   votes, announcements or releases before the resolution date that could
+                   decide it.
+                3. Base rates: how often comparable events have happened in comparable time
+                   windows (e.g. past years, past instances of the same process).
+                4. Prediction-market prices, betting odds, expert or official expectations.
+                5. What would most plausibly make each outcome happen.
+                """
+            )
+            kind = "multiple-choice" if isinstance(question, MultipleChoiceQuestion) else (
+                "date" if isinstance(question, DateQuestion) else "yes/no"
+            )
+        options = (
+            f"\nOptions: {question.options}\n"
+            if isinstance(question, MultipleChoiceQuestion)
+            else ""
+        )
         return clean_indents(
             f"""
             You are the research assistant to a professional forecaster. Use web search and
-            web fetch to gather the facts needed to forecast the numeric question below.
+            web fetch to gather the facts needed to forecast the {kind} question below.
             Do not forecast yourself; report facts.
 
-            Prioritise primary sources: the official agency, statistics office, company
-            filing or dataset named in the resolution criteria. Open the actual release or
-            data page when you can, not only news coverage.
+            Prioritise primary sources: the official agency, statistics office, company,
+            court, organiser or dataset named in the resolution criteria. Open the actual
+            page when you can, not only news coverage.
 
-            Report, with dates and source URLs:
-            1. Whether the resolving value has already been published. If it has, state it
-               exactly and quote the source.
-            2. The most recent values of the same series (at least the last 6 releases or
-               observations when they exist), so the forecaster can judge typical changes.
-            3. When the next relevant release is scheduled.
-            4. Consensus forecasts, guidance, nowcasts or market prices for this value.
-            5. Anything unusual that could move the value outside its normal range.
+            {task}
 
             Keep it under 600 words.
 
@@ -242,7 +308,7 @@ class FallTemplateBot2026(ForecastBot):
 
             Question:
             {question.question_text}
-
+            {options}
             Resolution criteria:
             {question.resolution_criteria}
 
@@ -326,7 +392,27 @@ class FallTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = None
+        if self._use_claude(question):
+            claude_prompt = prompt.replace(
+                "You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.",
+                "Anchor on base rates for comparable events and on what is already scheduled; weigh the status quo where it really applies, but do not lean toward No just because Yes requires something to happen. Be calibrated: use extreme probabilities only when the evidence is decisive.",
+            )
+            try:
+                reasoning = await claude_ask(claude_prompt, web=False, timeout=600)
+                reasoning = "(Forecast reasoning by Claude.)\n" + reasoning
+            except ClaudeUnavailable as e:
+                logger.warning(f"Claude forecast failed for {question.page_url}, falling back: {e}")
+            if reasoning is not None:
+                decimal_pred = self._read_binary_probability(reasoning)
+                if decimal_pred is not None:
+                    logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+                    logger.info(
+                        f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
+                    )
+                    return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+        if reasoning is None:
+            reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -408,7 +494,35 @@ class FallTemplateBot2026(ForecastBot):
             {self._create_resolved_question_parsing_message()}
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = None
+        if self._use_claude(question):
+            claude_prompt = prompt.replace(
+                "You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.",
+                "Anchor on base rates and on what is already scheduled, and be calibrated: keep some probability on options that are genuinely possible, but do not spread probability evenly when the evidence clearly favours some options. In the final block write each option exactly as given, one per line, as \"<option>: NN%\", summing to 100%.",
+            )
+            try:
+                reasoning = await claude_ask(claude_prompt, web=False, timeout=600)
+                reasoning = "(Forecast reasoning by Claude.)\n" + reasoning
+            except ClaudeUnavailable as e:
+                logger.warning(f"Claude forecast failed for {question.page_url}, falling back: {e}")
+            if reasoning is not None:
+                probs = self._read_option_probabilities(reasoning, question.options)
+                if probs is not None:
+                    predicted_option_list = PredictedOptionList(
+                        predicted_options=[
+                            PredictedOption(option_name=o, probability=p)
+                            for o, p in zip(question.options, probs)
+                        ]
+                    )
+                    logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+                    logger.info(
+                        f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
+                    )
+                    return ReasonedPrediction(
+                        prediction_value=predicted_option_list, reasoning=reasoning
+                    )
+        if reasoning is None:
+            reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
@@ -824,6 +938,11 @@ if __name__ == "__main__":
         help="Use Claude (local Claude Code CLI) for numeric/discrete research and forecasts",
     )
     parser.add_argument(
+        "--claude-all",
+        action="store_true",
+        help="Use Claude (local Claude Code CLI) for every question type",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Forecast but don't publish anything to Metaculus",
@@ -868,6 +987,7 @@ if __name__ == "__main__":
     )
 
     template_bot.claude_numeric = args.claude_numeric
+    template_bot.claude_all = args.claude_all
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
