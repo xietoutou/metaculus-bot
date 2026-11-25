@@ -21,6 +21,7 @@ bot = m.FallTemplateBot2026(
 )
 import os
 bot.claude_numeric = os.environ.get("DRY_CLAUDE") == "1"
+bot.claude_all = os.environ.get("DRY_CLAUDE") == "all"
 t = time.time()
 reps = asyncio.run(bot.forecast_questions(qs, return_exceptions=True))
 for q, r in zip(qs, reps):
